@@ -8,192 +8,268 @@
 #
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 # GNU General Public License for more details.
 #
 # You should have received a copy of the GNU General Public License
-# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+# along with this program. If not, see <http://www.gnu.org/licenses/>.
 #
 
-# [
+# ─── Bootstrap ────────────────────────────────────────────────────────────────
 source "$SRC_DIR/scripts/utils/build_utils.sh" || return 1
-# ]
+
+# ─── Shell compatibility guard ────────────────────────────────────────────────
+if [[ -z "${BASH_VERSION:-}" || "${BASH_VERSINFO[0]}" -lt 4 ]]; then
+    echo "ERROR: build_utils.sh requires bash >= 4.0" >&2
+    return 1
+fi
+
+# ─── Internal helpers ─────────────────────────────────────────────────────────
+
+# _CHAR_TO_ORD <char>
+# Returns the ASCII ordinal of a single character (POSIX-safe, no printf %d).
+_CHAR_TO_ORD()
+{
+    local c="$1"
+    # Use LC_CTYPE=C so printf %d works on the byte value portably.
+    LC_CTYPE=C printf '%d' "'$c"
+}
+
+# _STR_COMPARE <a> <b>
+# Lexicographic comparison of two single characters.
+# Returns 0 if a > b, 1 if a < b, 2 if a == b.
+_STR_COMPARE()
+{
+    local a="$1" b="$2"
+    local oa ob
+    oa="$(_CHAR_TO_ORD "$a")"
+    ob="$(_CHAR_TO_ORD "$b")"
+    if   (( oa > ob )); then return 0
+    elif (( oa < ob )); then return 1
+    else                     return 2
+    fi
+}
+
+# ─── Public API ───────────────────────────────────────────────────────────────
 
 # COMPARE_SEC_BUILD_VERSION <string1> <string2>
-# Returns whether or not `string1` build number is older than `string2`.
+# Returns 0 (true) if string1 is newer than OR equal to string2, 1 if older.
+#
+# Samsung build version scheme (e.g. A528BXXU1DWA4):
+#   [Model][Region][FW-type][Rollback][Major][Year][Month][Incremental]
+#   The last 4 chars encode Major / Year / Month / Incremental.
 COMPARE_SEC_BUILD_VERSION()
 {
-    local STRING1="$1"
-    local STRING2="$2"
+    _CHECK_NON_EMPTY_PARAM "STRING1" "$1" || return 1
+    _CHECK_NON_EMPTY_PARAM "STRING2" "$2" || return 1
 
-    STRING1="$(cut -d "/" -f 1 -s <<< "$STRING1")"
-    STRING2="$(cut -d "/" -f 1 -s <<< "$STRING2")"
+    # Strip everything after the first "/" (PDA field only).
+    local S1="${1%%/*}"
+    local S2="${2%%/*}"
 
-    # Samsung Android OS build version scheme works as follows (eg. A528BXXU1DWA4):
-    # - A528B: Model number
-    # - XX: Region (XX = EUR_OPEN)
-    # - U: Firmware type (U = full update, S = security update)
-    # - 1: Rollback protection bit
-    # - D: Major OS version (D = 4th OS rollout)
-    # - W: Year (W = 2023)
-    # - A: Month (A = january)
-    # - 4: Incremental version
-    local STRING1_MAJOR="${STRING1:${#STRING1}-4:1}"
-    local STRING1_YEAR="${STRING1:${#STRING1}-3:1}"
-    local STRING1_MONTH="${STRING1:${#STRING1}-2:1}"
-    local STRING1_INCREMENTAL="${STRING1:${#STRING1}-1:1}"
+    # Validate: we need at least 4 trailing version chars.
+    if (( ${#S1} < 4 || ${#S2} < 4 )); then
+        LOGE "COMPARE_SEC_BUILD_VERSION: string too short (\"$1\" / \"$2\")"
+        return 1
+    fi
 
-    local STRING2_MAJOR="${STRING2:${#STRING2}-4:1}"
-    local STRING2_YEAR="${STRING2:${#STRING2}-3:1}"
-    local STRING2_MONTH="${STRING2:${#STRING2}-2:1}"
-    local STRING2_INCREMENTAL="${STRING2:${#STRING2}-1:1}"
+    # Extract the 4 version chars from the tail using pure-bash substrings
+    # (avoids four 'cut' subshells from the original implementation).
+    local S1_MAJOR="${S1: -4:1}"  S1_YEAR="${S1: -3:1}"
+    local S1_MONTH="${S1: -2:1}"  S1_INC="${S1: -1:1}"
 
-    [[ "$STRING1_MAJOR" > "$STRING2_MAJOR" ]] && return 0
-    [[ "$STRING1_MAJOR" < "$STRING2_MAJOR" ]] && return 1
-    [[ "$STRING1_YEAR" > "$STRING2_YEAR" ]] && return 0
-    [[ "$STRING1_YEAR" < "$STRING2_YEAR" ]] && return 1
-    [[ "$STRING1_MONTH" > "$STRING2_MONTH" ]] && return 0
-    [[ "$STRING1_MONTH" < "$STRING2_MONTH" ]] && return 1
-    [[ "$STRING1_INCREMENTAL" > "$STRING2_INCREMENTAL" ]] && return 0
-    [[ "$STRING1_INCREMENTAL" < "$STRING2_INCREMENTAL" ]] && return 1
+    local S2_MAJOR="${S2: -4:1}"  S2_YEAR="${S2: -3:1}"
+    local S2_MONTH="${S2: -2:1}"  S2_INC="${S2: -1:1}"
 
-    return 0
+    local -a S1_PARTS=( "$S1_MAJOR" "$S1_YEAR" "$S1_MONTH" "$S1_INC" )
+    local -a S2_PARTS=( "$S2_MAJOR" "$S2_YEAR" "$S2_MONTH" "$S2_INC" )
+
+    local i rc
+    for (( i = 0; i < 4; i++ )); do
+        _STR_COMPARE "${S1_PARTS[$i]}" "${S2_PARTS[$i]}"
+        rc=$?
+        (( rc == 0 )) && return 0   # S1 component is greater → newer
+        (( rc == 1 )) && return 1   # S1 component is lesser  → older
+        # rc == 2 → equal, continue to next component
+    done
+
+    return 0   # All components equal → treat as "not older"
 }
 
 # EXTRACT_FILE_FROM_TAR <tar> <file>
-# Extract the desidered file from the supplied tar archive.
+# Extracts <file> from <tar>, handling bare / .ext4 / .lz4 variants.
+# Cleans up any stale copy before extracting.
 EXTRACT_FILE_FROM_TAR()
 {
     _CHECK_NON_EMPTY_PARAM "MODEL" "$MODEL" || return 1
-    _CHECK_NON_EMPTY_PARAM "CSC" "$CSC" || return 1
-    _CHECK_NON_EMPTY_PARAM "TAR" "$1" || return 1
-    _CHECK_NON_EMPTY_PARAM "FILE" "$2" || return 1
+    _CHECK_NON_EMPTY_PARAM "CSC"   "$CSC"   || return 1
+    _CHECK_NON_EMPTY_PARAM "TAR"   "$1"     || return 1
+    _CHECK_NON_EMPTY_PARAM "FILE"  "$2"     || return 1
 
     local TAR="$1"
     local FILE="$2"
+    local DEST_DIR="$FW_DIR/${MODEL}_${CSC}"
 
-    if [ ! -f "$TAR" ]; then
+    [[ -f "$TAR" ]] || {
         LOGE "File not found: ${TAR//$SRC_DIR\//}"
         return 1
-    fi
+    }
 
-    [ -f "$FW_DIR/${MODEL}_${CSC}/$FILE" ] && rm -rf "$FW_DIR/${MODEL}_${CSC}/$FILE"
-    [ -f "$FW_DIR/${MODEL}_${CSC}/$FILE.ext4" ] && rm -rf "$FW_DIR/${MODEL}_${CSC}/$FILE.ext4"
-    [ -f "$FW_DIR/${MODEL}_${CSC}/$FILE.lz4" ] && rm -rf "$FW_DIR/${MODEL}_${CSC}/$FILE.lz4"
+    # Remove any stale variants atomically before extracting.
+    rm -f "$DEST_DIR/$FILE" "$DEST_DIR/$FILE.ext4" "$DEST_DIR/$FILE.lz4"
 
     if FILE_EXISTS_IN_TAR "$TAR" "$FILE"; then
-        LOG "- Extracting $FILE..."
-        EVAL "tar xf \"$TAR\" -C \"$FW_DIR/${MODEL}_${CSC}\" \"$FILE\"" || return 1
+        LOG "- Extracting $FILE from $(basename "$TAR")..."
+        EVAL "tar xf \"$TAR\" -C \"$DEST_DIR\" \"$FILE\"" || return 1
+
     elif FILE_EXISTS_IN_TAR "$TAR" "$FILE.ext4"; then
-        LOG "- Extracting $FILE.ext4..."
-        EVAL "tar xf \"$TAR\" -C \"$FW_DIR/${MODEL}_${CSC}\" \"$FILE.ext4\"" || return 1
-        EVAL "mv -f \"$FW_DIR/${MODEL}_${CSC}/$FILE.ext4\" \"$FW_DIR/${MODEL}_${CSC}/$FILE\"" || return 1
+        LOG "- Extracting $FILE.ext4 from $(basename "$TAR")..."
+        EVAL "tar xf \"$TAR\" -C \"$DEST_DIR\" \"$FILE.ext4\"" || return 1
+        mv -f "$DEST_DIR/$FILE.ext4" "$DEST_DIR/$FILE"              || return 1
+
     elif FILE_EXISTS_IN_TAR "$TAR" "$FILE.lz4"; then
-        LOG "- Extracting $FILE.lz4..."
-        EVAL "tar xf \"$TAR\" -C \"$FW_DIR/${MODEL}_${CSC}\" \"$FILE.lz4\"" || return 1
+        LOG "- Extracting $FILE.lz4 from $(basename "$TAR")..."
+        EVAL "tar xf \"$TAR\" -C \"$DEST_DIR\" \"$FILE.lz4\"" || return 1
         LOG "- Decompressing $FILE.lz4..."
-        EVAL "lz4 -d --rm \"$FW_DIR/${MODEL}_${CSC}/$FILE.lz4\" \"$FW_DIR/${MODEL}_${CSC}/$FILE\"" || return 1
+        # --rm removes the .lz4 source after decompression; -d = decompress.
+        EVAL "lz4 -d --rm \"$DEST_DIR/$FILE.lz4\" \"$DEST_DIR/$FILE\"" || return 1
+
+    else
+        LOGE "\"$FILE\" not found in $(basename "$TAR") (tried bare/.ext4/.lz4)"
+        return 1
     fi
 
     return 0
 }
 
-# EXTRACT_FILE_FROM_TAR <tar> <file>
-# Returns whether or not the desidered file exists in the supplied tar archive.
+# FILE_EXISTS_IN_TAR <tar> <file>
+# Returns 0 if <file> exists inside <tar>, 1 otherwise.
 FILE_EXISTS_IN_TAR()
 {
-    _CHECK_NON_EMPTY_PARAM "TAR" "$1" || return 1
+    _CHECK_NON_EMPTY_PARAM "TAR"  "$1" || return 1
     _CHECK_NON_EMPTY_PARAM "FILE" "$2" || return 1
 
-    tar tf "$1" "$2" &> /dev/null
-    return $?
+    tar tf "$1" "$2" &>/dev/null
 }
 
 # GET_LATEST_FIRMWARE <model> <csc>
-# Returns the latest available firmware for the supplied model & CSC in the following format: PDA/CSC/MODEM
+# Fetches and prints the latest firmware string (PDA/CSC/MODEM) from Samsung FOTA servers.
 GET_LATEST_FIRMWARE()
 {
     _CHECK_NON_EMPTY_PARAM "MODEL" "$1" || return 1
-    _CHECK_NON_EMPTY_PARAM "CSC" "$2" || return 1
+    _CHECK_NON_EMPTY_PARAM "CSC"   "$2" || return 1
 
-    curl -s --retry 5 --retry-delay 5 "https://fota-cloud-dn.ospserver.net/firmware/$2/$1/version.xml" \
-        | perl -nE 'say $1 if /<latest[^>]*>(.*?)<\/latest>/'
+    local MODEL_ARG="$1"
+    local CSC_ARG="$2"
+    local URL="https://fota-cloud-dn.ospserver.net/firmware/${CSC_ARG}/${MODEL_ARG}/version.xml"
+    local OUT
+
+    # --fail    → non-zero on HTTP 4xx/5xx
+    # --silent  → suppress progress meter
+    # --show-error → still print errors to stderr
+    OUT="$(curl --fail --silent --show-error \
+               --retry 5 --retry-delay 5 \
+               --max-time 30 \
+               "$URL")" || {
+        LOGE "Failed to fetch firmware version for ${MODEL_ARG}/${CSC_ARG}"
+        return 1
+    }
+
+    # Use awk instead of perl for portability (not all build hosts have perl).
+    awk 'match($0, /<latest[^>]*>([^<]+)<\/latest>/, a) { print a[1] }' <<< "$OUT"
 }
 
-# PARSE_FIRMWARE_STRING <string>
-# Parses the supplied string and stores each value in MODEL/CSC/IMEI/SERIAL_NO variables.
-# - The supplied string must be in the following format: <MODEL>/<CSC>/<IMEI/SN>
-# - IMEI/SN that matches the given model is required to download the firmware from FUS
+# PARSE_FIRMWARE_STRING <model>/<csc>/<imei-or-sn>
+# Validates and exports MODEL, CSC, and either IMEI or SERIAL_NO.
 PARSE_FIRMWARE_STRING()
 {
-    local STRING="$1"
+    local STRING="${1:-}"
 
-    if [ ! "$STRING" ]; then
+    [[ -n "$STRING" ]] || {
         LOGE "Firmware value cannot be empty"
         return 1
-    fi
+    }
 
-    MODEL="$(cut -d "/" -f 1 -s <<< "$STRING")"
-    if [ ! "$MODEL" ]; then
+    # Split on "/" using read for a single pass (faster than three 'cut' calls).
+    local MODEL_V CSC_V THIRD_V EXTRA_V
+    IFS='/' read -r MODEL_V CSC_V THIRD_V EXTRA_V <<< "$STRING"
+
+    # Model
+    [[ -n "$MODEL_V" ]] || {
         LOGE "No device model value found in \"$STRING\""
         return 1
-    fi
+    }
 
-    CSC="$(cut -d "/" -f 2 -s <<< "$STRING")"
-    if [ ! "$CSC" ]; then
+    # CSC — must be exactly 3 characters
+    [[ -n "$CSC_V" ]] || {
         LOGE "No CSC value found in \"$STRING\""
         return 1
-    elif [[ "${#CSC}" != "3" ]]; then
-        LOGE "CSC not valid in \"$STRING\": $CSC"
+    }
+    (( ${#CSC_V} == 3 )) || {
+        LOGE "CSC not valid in \"$STRING\": $CSC_V"
         return 1
-    fi
+    }
 
-    local THIRD
-    THIRD="$(cut -d "/" -f 3 -s <<< "$STRING")"
-    if [ ! "$THIRD" ]; then
+    # IMEI / Serial number
+    [[ -n "$THIRD_V" ]] || {
         LOGE "No IMEI/SN value found in \"$STRING\""
         return 1
-    elif [[ "${#THIRD}" == "11" ]] && [[ "$THIRD" == "R"* ]]; then
-        SERIAL_NO="$THIRD"
-    elif [[ "${#THIRD}" -ge "8" ]] && [[ "${#THIRD}" -le "15" ]] && [[ "$THIRD" =~ ^[+-]?[0-9]+$ ]]; then
-        # Allow uncomplete IMEIs as samloader can generate them by providing the first 8 numbers (TAC)
-        IMEI="$THIRD"
+    }
+
+    # Serial: 11 chars starting with "R"
+    if (( ${#THIRD_V} == 11 )) && [[ "$THIRD_V" == R* ]]; then
+        SERIAL_NO="$THIRD_V"
+        unset IMEI
+    # IMEI: 8–15 digits (partial TAC allowed for samloader compatibility)
+    elif (( ${#THIRD_V} >= 8 && ${#THIRD_V} <= 15 )) && [[ "$THIRD_V" =~ ^[0-9]+$ ]]; then
+        IMEI="$THIRD_V"
+        unset SERIAL_NO
     else
-        LOGE "No valid IMEI/SN in \"$STRING\": $THIRD"
+        LOGE "No valid IMEI/SN in \"$STRING\": $THIRD_V"
         return 1
     fi
 
+    [[ -n "$EXTRA_V" ]] && LOGW "Extra fields ignored in firmware string: \"$STRING\""
+
+    # Export only after all validation passes.
+    MODEL="$MODEL_V"
+    CSC="$CSC_V"
     return 0
 }
 
 # UNSPARSE_IMAGE <file> [output]
-# Unsparse the supplied file, a different output path can be provided optionally.
+# Converts an Android sparse image to a raw image in-place or to [output].
 UNSPARSE_IMAGE()
 {
-    _CHECK_NON_EMPTY_PARAM "FILE" "$1" || exit 1
+    _CHECK_NON_EMPTY_PARAM "FILE" "$1" || return 1
 
     local FILE="$1"
-    local OUTPUT_PATH="$2"
+    local OUTPUT_PATH="${2:-}"
     local REPLACE=false
 
-    if [ ! -f "$FILE" ]; then
+    [[ -f "$FILE" ]] || {
         LOGE "File not found: ${FILE//$SRC_DIR\//}"
         return 1
-    fi
+    }
 
-    if ! IS_SPARSE_IMAGE "$FILE"; then
-        LOGW "Not a Android sparse image: ${FILE//$SRC_DIR\//}"
+    IS_SPARSE_IMAGE "$FILE" || {
+        LOGW "Not an Android sparse image: ${FILE//$SRC_DIR\//}"
         return 0
-    fi
+    }
 
-    if [ ! "$OUTPUT_PATH" ]; then
-        OUTPUT_PATH="$(dirname "$FILE")/unsparse_$(basename "$FILE")"
+    if [[ -z "$OUTPUT_PATH" ]]; then
+        # Write to a sibling temp file to keep the same directory (avoids
+        # cross-device mv if /tmp is on a different filesystem).
+        OUTPUT_PATH="${FILE}.unsparse.$$"
         REPLACE=true
     fi
 
     LOG "- Unsparsing $(basename "$FILE")..."
+    EVAL "simg2img \"$FILE\" \"$OUTPUT_PATH\"" || {
+        rm -f "$OUTPUT_PATH"
+        return 1
+    }
 
-    EVAL "simg2img \"$FILE\" \"$OUTPUT_PATH\"" || return 1
     if $REPLACE; then
         mv -f "$OUTPUT_PATH" "$FILE"
     fi
