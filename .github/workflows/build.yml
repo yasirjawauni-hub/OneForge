@@ -1,4 +1,4 @@
-name: Build ArtisanROM
+name: OneForge
 
 on:
   workflow_dispatch:
@@ -12,17 +12,66 @@ on:
           - release
           - debug
           - test
+      device:
+        description: "Device target filter (e.g. z3s). Leave blank for all."
+        required: false
+        default: ""
 
+# ---------------------------------------------------------------------------
+# Job 1 — Discover all targets under device/ (or configs/) at runtime.
+# Adding a new device config file is all that's ever needed — no matrix edits.
+# ---------------------------------------------------------------------------
 jobs:
-  build:
+  discover:
     runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.scan.outputs.matrix }}
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: device
+          fetch-depth: 1
+
+      - name: Scan device targets
+        id: scan
+        env:
+          DEVICE_FILTER: ${{ github.event.inputs.device }}
+        run: |
+          ENTRIES="[]"
+
+          # Discover targets: any directory directly under device/
+          # (adjust glob if your layout differs, e.g. configs/*.sh)
+          for dir in device/*/; do
+            [ -d "$dir" ] || continue
+            target="$(basename "$dir")"
+
+            if [ -n "$DEVICE_FILTER" ] && [ "$target" != "$DEVICE_FILTER" ]; then
+              continue
+            fi
+
+            ENTRIES=$(echo "$ENTRIES" | jq --arg t "$target" '. += [{"target": $t}]')
+          done
+
+          echo "matrix=$(echo "$ENTRIES" | jq -c '{include: .}')" >> "$GITHUB_OUTPUT"
+          echo "Discovered targets:"
+          echo "$ENTRIES" | jq -r '.[].target'
+
+  # ---------------------------------------------------------------------------
+  # Job 2 — Build + upload one job per discovered device.
+  # ---------------------------------------------------------------------------
+  build:
+    needs: discover
+    if: ${{ needs.discover.outputs.matrix != '{"include":[]}' }}
+    runs-on: ubuntu-24.04
+
     permissions:
       contents: write
 
     strategy:
       fail-fast: false
-      matrix:
-        target: [x1s, y2s, z3s, c1s, c2s, r8s, beyond0lte, beyond1lte, beyond2lte, beyondx]
+      matrix: ${{ fromJson(needs.discover.outputs.matrix) }}
 
     env:
       RELEASE_REPO: "ArtisanROM/rom_resources"
@@ -30,13 +79,18 @@ jobs:
 
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
         with:
           submodules: recursive
+          fetch-depth: 1
 
       - name: Free disk space (1/3)
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL
           sudo docker image prune --all --force
           sudo docker builder prune -a
 
@@ -51,9 +105,12 @@ jobs:
           retain: compiler_cmake
 
       - name: Set up build environment
+        env:
+          PLATFORM_KEY_PK8: ${{ secrets.PLATFORM_KEY_PK8 }}
+          PLATFORM_KEY_PEM: ${{ secrets.PLATFORM_KEY_PEM }}
         run: |
-          sudo apt update
-          DEBIAN_FRONTEND=noninteractive sudo apt install -yq \
+          sudo apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive sudo apt-get install -yq --no-install-recommends \
             p7zip-full jq attr ccache clang ffmpeg golang \
             libbrotli-dev libgtest-dev libprotobuf-dev libunwind-dev libpcre2-dev \
             libzstd-dev linux-modules-extra-$(uname -r) lld protobuf-compiler webp \
@@ -61,15 +118,25 @@ jobs:
           sudo modprobe erofs f2fs
           git config --global user.name "github-actions[bot]"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          echo -n "${{ secrets.PLATFORM_KEY_PK8 }}" | base64 --decode > security/extremerom_platform.pk8
-          echo -n "${{ secrets.PLATFORM_KEY_PEM }}" | base64 --decode > security/extremerom_platform.x509.pem
+          echo "$PLATFORM_KEY_PK8" | base64 --decode > security/extremerom_platform.pk8
+          echo "$PLATFORM_KEY_PEM" | base64 --decode > security/extremerom_platform.x509.pem
 
       - name: Set up JDK 21
-        uses: actions/setup-java@v5
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: 21
+          java-version: "21"
           cache: gradle
+
+      - name: Cache build dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go
+            ~/.ccache
+          key: build-deps-${{ runner.os }}-${{ hashFiles('scripts/build_dependencies.sh') }}
+          restore-keys: |
+            build-deps-${{ runner.os }}-
 
       - name: Build dependencies
         run: |
@@ -112,80 +179,78 @@ jobs:
         env:
           PIXELDRAIN_API_KEY: ${{ secrets.PD_API }}
           GH_TOKEN: ${{ secrets.PAT }}
-          RELEASE_REPO: "ArtisanROM/rom_resources"
           BUILD_TYPE: ${{ github.event.inputs.build_type }}
         run: |
           mkdir -p split_tmp
 
-          for file in out/*.zip; do
-            if [ ! -f "$file" ]; then
-              echo "No ZIP files found to upload."
-              continue
-            fi
+          shopt -s nullglob
+          ZIP_FILES=(out/*.zip)
+          if [ ${#ZIP_FILES[@]} -eq 0 ]; then
+            echo "No ZIP files found in out/ — nothing to upload."
+            exit 0
+          fi
 
+          for file in "${ZIP_FILES[@]}"; do
             FILE_NAME=$(basename "$file")
             FILE_SIZE=$(stat -c%s "$file")
             FILE_MD5=$(md5sum "$file" | awk '{print $1}')
             VERSION=$(echo "$FILE_NAME" | grep -oP '\d+\.\d+\.\d+')
             BUILD_DATE=$(date +%Y-%m-%d)
 
-            # Always upload to Pixeldrain
+            # --- Pixeldrain (always) ----------------------------------------
             echo "Uploading $FILE_NAME to Pixeldrain..."
-            RESPONSE=$(curl -s -T "$file" -u :$PIXELDRAIN_API_KEY https://pixeldrain.com/api/file/)
+            RESPONSE=$(curl -fsSL -T "$file" -u ":$PIXELDRAIN_API_KEY" https://pixeldrain.com/api/file/)
             FILE_ID=$(echo "$RESPONSE" | jq -r '.id')
             PIXEL_URL="https://pixeldrain.com/u/$FILE_ID"
             echo "Pixeldrain URL: $PIXEL_URL"
 
-            # Split + GitHub Release for release + test
+            # --- Split + GitHub Release (release & test) ---------------------
             PART_LINKS=()
             if [ "$BUILD_TYPE" = "release" ] || [ "$BUILD_TYPE" = "test" ]; then
               echo "Splitting $FILE_NAME into 6 parts..."
-              cd split_tmp
-              split -d -n 6 "../$file" "${FILE_NAME}.part_"
-              cd ..
+              rm -rf split_tmp && mkdir -p split_tmp
+              split -d -n 6 "$file" "split_tmp/${FILE_NAME}.part_"
 
-              TAG_NAME="v$VERSION-${{ matrix.target }}"
+              TAG_NAME="v${VERSION}-${{ matrix.target }}"
               RELEASE_NAME="${VERSION}-${{ matrix.target }}-${BUILD_DATE}"
-
               echo "Creating GitHub Release: $RELEASE_NAME"
 
-              RELEASE_DATA=$(jq -n \
-                --arg tag "$TAG_NAME" \
-                --arg name "$RELEASE_NAME" \
-                '{ tag_name: $tag, name: $name, draft: false, prerelease: false }')
-
-              RELEASE_RESPONSE=$(curl -s -X POST \
+              RELEASE_RESPONSE=$(curl -fsSL -X POST \
                 -H "Authorization: token $GH_TOKEN" \
                 -H "Content-Type: application/json" \
-                -d "$RELEASE_DATA" \
-                https://api.github.com/repos/$RELEASE_REPO/releases)
+                -d "$(jq -n --arg tag "$TAG_NAME" --arg name "$RELEASE_NAME" \
+                      '{tag_name:$tag, name:$name, draft:false, prerelease:false}')" \
+                "https://api.github.com/repos/$RELEASE_REPO/releases")
 
               RELEASE_ID=$(echo "$RELEASE_RESPONSE" | jq -r '.id')
-              if [ "$RELEASE_ID" = "null" ]; then
-                echo "ERROR: Release not created. Check GH_TOKEN and permissions."
+              if [ -z "$RELEASE_ID" ] || [ "$RELEASE_ID" = "null" ]; then
+                echo "ERROR: Release creation failed."
+                echo "$RELEASE_RESPONSE"
                 exit 1
               fi
-              echo "Release created: $RELEASE_ID"
+              echo "Release ID: $RELEASE_ID"
 
-              # Upload all split parts
               for part in split_tmp/*; do
                 PART_NAME=$(basename "$part")
-                UPLOAD_RESPONSE=$(curl -s -X POST \
+                UPLOAD_RESPONSE=$(curl -fsSL -X POST \
                   -H "Authorization: token $GH_TOKEN" \
                   -H "Content-Type: application/octet-stream" \
                   --data-binary @"$part" \
                   "https://uploads.github.com/repos/$RELEASE_REPO/releases/$RELEASE_ID/assets?name=$PART_NAME")
                 PART_URL=$(echo "$UPLOAD_RESPONSE" | jq -r '.browser_download_url')
                 PART_LINKS+=("$PART_URL")
+                echo "Uploaded part: $PART_URL"
               done
             fi
 
-            # Generate OTA XML for release only
+            # --- OTA XML (release only) --------------------------------------
             if [ "$BUILD_TYPE" = "release" ]; then
               echo "Generating OTA XML..."
-              git clone --branch main https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }} updater_repo
+              git clone --depth 1 --branch main \
+                "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}" \
+                updater_repo
               cd updater_repo
-              git checkout main
+
               mkdir -p updater
               XML_FILE="updater/${{ matrix.target }}.xml"
 
@@ -196,12 +261,12 @@ jobs:
                 echo "    <version>$VERSION</version>"
                 echo "    <date>$BUILD_DATE</date>"
                 echo "    <filename>$FILE_NAME</filename>"
-              } > $XML_FILE
+              } > "$XML_FILE"
 
               INDEX=1
               for url in "${PART_LINKS[@]}"; do
-                echo "    <part$INDEX>$url</part$INDEX>" >> $XML_FILE
-                INDEX=$((INDEX+1))
+                echo "    <part${INDEX}>$url</part${INDEX}>" >> "$XML_FILE"
+                INDEX=$((INDEX + 1))
               done
 
               {
@@ -209,9 +274,9 @@ jobs:
                 echo "    <size>$FILE_SIZE</size>"
                 echo '  </rom>'
                 echo '</roms>'
-              } >> $XML_FILE
+              } >> "$XML_FILE"
 
-              git add $XML_FILE
+              git add "$XML_FILE"
               git commit -m "updater: ${{ matrix.target }}.xml: Update to $VERSION" || true
               git pull --rebase origin main
               git push origin main
